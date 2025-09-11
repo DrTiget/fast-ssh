@@ -1,115 +1,159 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
 using FastSSH.Models;
-using Renci.SshNet;
-using Renci.SshNet.Common;
 
 namespace FastSSH.Services;
 
-public class SshService
+public static class SshService
 {
-    public static async Task ConnectToServerAsync(ServerConfig server)
+    public static int ConnectWithSystemSsh(ConnectModel server, string? keywordHint = null)
+    {
+        if (!string.IsNullOrWhiteSpace(keywordHint))
+            Console.WriteLine($"Подсказка: {keywordHint}");
+
+        string? keyPath = null;
+        try
+        {
+            // 1) Сохраняем приватный ключ (если задан строкой)
+            if (!string.IsNullOrWhiteSpace(server.PrivateKey))
+            {
+                keyPath = WriteTempPrivateKey(server.PrivateKey);
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                    HardenKeyOnWindows(keyPath);
+                else
+                    Chmod600(keyPath);
+            }
+
+            // 2) Собираем аргументы и запускаем "ssh" БЕЗ shell
+            var psi = new ProcessStartInfo("ssh") { UseShellExecute = false };
+            psi.ArgumentList.Add("-tt"); // форсируем PTY для TUI
+
+            if (server.Port > 0 && server.Port != 22)
+            {
+                psi.ArgumentList.Add("-p");
+                psi.ArgumentList.Add(server.Port.ToString());
+            }
+
+            if (!string.IsNullOrEmpty(keyPath))
+            {
+                psi.ArgumentList.Add("-i");
+                psi.ArgumentList.Add(keyPath); // никаких кавычек!
+            }
+
+            psi.ArgumentList.Add("-o");
+            psi.ArgumentList.Add("StrictHostKeyChecking=accept-new");
+
+            psi.ArgumentList.Add($"{server.Username}@{server.Host}");
+
+            Console.WriteLine($"→ Запускаю системный ssh: {server.Username}@{server.Host}:{server.Port}");
+
+            int exitCode;
+            using (var p = Process.Start(psi)!)
+            {
+                p.WaitForExit();
+                exitCode = p.ExitCode;
+            }
+
+            return exitCode;
+        }
+        finally
+        {
+            // 3) Удаляем временный ключ безопасно (Linux: сначала shred, затем rm/File.Delete)
+            if (!string.IsNullOrEmpty(keyPath))
+                SafeDeleteKey(keyPath);
+        }
+    }
+
+    // ---------- helpers ----------
+
+    private static string WriteTempPrivateKey(string privateKey)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "fastssh");
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, $"fastssh_key_{Guid.NewGuid():N}");
+        File.WriteAllText(path, privateKey, new UTF8Encoding(false)); // без BOM
+        return path;
+    }
+
+    private static void Chmod600(string path)
     {
         try
         {
-            ConnectionInfo connectionInfo = CreateConnectionInfo(server);
-            
-            using var client = new SshClient(connectionInfo);
-            
-            Console.WriteLine($"Connecting to {server.Name} ({server.Host}:{server.Port})...");
-            
-            await Task.Run(() => client.Connect());
-            
-            if (!client.IsConnected)
-            {
-                throw new InvalidOperationException("Failed to establish SSH connection");
-            }
-
-            Console.WriteLine($"Connected successfully to {server.Name}!");
-            Console.WriteLine("Starting interactive shell...");
-            Console.WriteLine("Type 'exit' or press Ctrl+C to disconnect.\n");
-
-            // Start interactive shell
-            await StartInteractiveShellAsync(client);
+            var psi = new ProcessStartInfo("/bin/chmod") { UseShellExecute = false };
+            psi.ArgumentList.Add("600");
+            psi.ArgumentList.Add(path);
+            Process.Start(psi)?.WaitForExit();
         }
-        catch (SshConnectionException ex)
-        {
-            throw new InvalidOperationException($"SSH connection failed: {ex.Message}", ex);
-        }
-        catch (SshAuthenticationException ex)
-        {
-            throw new InvalidOperationException($"SSH authentication failed: {ex.Message}", ex);
-        }
-        catch (Exception ex)
-        {
-            throw new InvalidOperationException($"Connection error: {ex.Message}", ex);
-        }
+        catch { /* best-effort */ }
     }
 
-    private static ConnectionInfo CreateConnectionInfo(ServerConfig server)
+    private static void HardenKeyOnWindows(string path)
     {
-        List<AuthenticationMethod> authMethods = new();
-
-        // Key-based authentication
-        if (!string.IsNullOrEmpty(server.KeyFile) && File.Exists(server.KeyFile))
+        try
         {
+            var who = RunCmdCapture("whoami").Trim();
+            if (string.IsNullOrEmpty(who)) who = Environment.UserName;
+
+            RunCmd($@"icacls ""{path}"" /inheritance:r");
+            RunCmd($@"icacls ""{path}"" /grant:r ""{who}"":F");
+        }
+        catch { /* best-effort */ }
+    }
+
+    private static void SafeDeleteKey(string path)
+    {
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                // Windows: просто удалить
+                if (File.Exists(path)) File.Delete(path);
+                return;
+            }
+
+            // Linux/macOS: сначала пробуем shred -u, затем обычное удаление
             try
             {
-                PrivateKeyFile keyFile;
-                if (!string.IsNullOrEmpty(server.KeyPassphrase))
-                {
-                    keyFile = new PrivateKeyFile(server.KeyFile, server.KeyPassphrase);
-                }
-                else
-                {
-                    keyFile = new PrivateKeyFile(server.KeyFile);
-                }
-                
-                authMethods.Add(new PrivateKeyAuthenticationMethod(server.Username, keyFile));
+                var psi = new ProcessStartInfo("shred") { UseShellExecute = false };
+                psi.ArgumentList.Add("-u");
+                psi.ArgumentList.Add("--");
+                psi.ArgumentList.Add(path);
+                using var p = Process.Start(psi);
+                p?.WaitForExit();
+                if (p?.ExitCode == 0) return;
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Warning: Could not load key file {server.KeyFile}: {ex.Message}");
-            }
-        }
+            catch { /* shred может отсутствовать — это нормально */ }
 
-        // Password-based authentication
-        if (!string.IsNullOrEmpty(server.Password))
+            // Fallback
+            if (File.Exists(path)) File.Delete(path);
+        }
+        catch
         {
-            authMethods.Add(new PasswordAuthenticationMethod(server.Username, server.Password));
+            // на крайний случай оставим файл — лучше оставить, чем уронить приложение
         }
-
-        if (authMethods.Count == 0)
-        {
-            throw new InvalidOperationException("No valid authentication method configured for server");
-        }
-
-        return new ConnectionInfo(server.Host, server.Port, server.Username, authMethods.ToArray());
     }
 
-    private static async Task StartInteractiveShellAsync(SshClient client)
+    private static void RunCmd(string cmd)
     {
-        using var shell = client.CreateShell(Console.OpenStandardInput(), 
-                                           Console.OpenStandardOutput(), 
-                                           Console.OpenStandardError());
-
-        var shellStopped = new TaskCompletionSource<bool>();
-
-        shell.Stopped += (sender, e) =>
+        Process.Start(new ProcessStartInfo("cmd.exe", "/C " + cmd)
         {
-            shellStopped.TrySetResult(true);
-        };
+            UseShellExecute = false,
+            CreateNoWindow = true
+        })?.WaitForExit();
+    }
 
-        shell.Start();
-
-        // Handle Ctrl+C gracefully
-        Console.CancelKeyPress += (sender, e) =>
+    private static string RunCmdCapture(string cmd)
+    {
+        var psi = new ProcessStartInfo("cmd.exe", "/C " + cmd)
         {
-            e.Cancel = true;
-            shell.Stop();
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            CreateNoWindow = true
         };
-
-        // Ожидание завершения shell
-        await shellStopped.Task;
-
-        Console.WriteLine("\nDisconnected from server.");
+        using var p = Process.Start(psi)!;
+        var s = p.StandardOutput.ReadToEnd();
+        p.WaitForExit();
+        return s;
     }
 }
